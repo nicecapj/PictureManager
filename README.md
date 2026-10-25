@@ -48,7 +48,13 @@
 ### 4. 이미지 Diff 비교 — 픽셀 차이 강조 모드
 ![Diff 차이 강조 모드](screenshots/diff-highlight.png)
 
-### 5. 내장 폴더 브라우저 모달
+### 5. 동영상 — 컨테이너만 다른 동일 영상 & 축소·재인코딩된 유사 영상
+![동영상 목록](screenshots/video-list.png)
+
+### 6. 동영상 Diff 비교 — 나란히 재생 & 길이·코덱·FPS·비트레이트 비교
+![동영상 Diff](screenshots/video-diff.png)
+
+### 7. 내장 폴더 브라우저 모달
 ![폴더 브라우저](screenshots/folder-browser.png)
 
 ---
@@ -71,6 +77,7 @@
    npm start
    ```
    또는 Windows에서 [`start.bat`](start.bat) 파일을 더블클릭하면 패키지 설치 확인 후 브라우저(`http://localhost:3000`)가 자동으로 열립니다.
+   `ffmpeg`/`ffprobe`를 찾을 수 없으면 `ffmpeg-static`/`ffprobe-static` 패키지를 자동으로 설치해 사용합니다 (관리자 권한 불필요).
 
 3. 브라우저 접속
    - [http://localhost:3000](http://localhost:3000)

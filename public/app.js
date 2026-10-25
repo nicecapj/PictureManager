@@ -187,7 +187,7 @@ function groupEl(g) {
     <div class="g-head">
       <span class="badge ${g.type}">${LABEL[g.type]}</span>
       ${g.nameConflict ? '<span class="badge conflict">⚠ 이름 같음·내용 다름</span>' : ''}
-      <span>${files.length}개 파일${g.type === 'similar' ? ` · ${g.subgroups.length}종 이미지` : ''}</span>
+      <span>${files.length}개 파일${g.type === 'similar' ? ` · ${g.subgroups.length}종 ${files[0].kind === 'video' ? '영상' : '이미지'}` : ''}</span>
       <span class="sp"></span>
       ${multi ? '<button class="btn ghost sm" data-act="diff">⇆ Diff 비교</button>' : ''}
     </div>
