@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Picture Manager · 사진 Diff & 동기화</title>
-  <meta name="description" content="두 폴더의 사진을 비교해 중복·유사 이미지를 찾아 한 폴더로 동기화하는 사진 관리 도구">
+  <meta name="description" content="두 폴더의 사진·동영상을 비교해 중복·유사 항목을 찾아 한 폴더로 동기화하는 사진 관리 도구">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
@@ -35,6 +35,8 @@
         <button class="tab" data-filter="onlyA">A에만 <em id="cnt-onlyA">0</em></button>
         <button class="tab" data-filter="onlyB">B에만 <em id="cnt-onlyB">0</em></button>
         <button class="tab" data-filter="unique">고유 전체 <em id="cnt-unique">0</em></button>
+        <button class="tab" data-filter="photo">🖼 사진 <em id="cnt-photo">0</em></button>
+        <button class="tab" data-filter="video">🎬 동영상 <em id="cnt-video">0</em></button>
       </nav>
       <div class="side-box">
         <input id="search" class="search" placeholder="파일명 검색…">
@@ -63,7 +65,7 @@
       <div id="empty" class="empty">
         <div class="empty-ico">🖼️</div>
         <h2>두 폴더를 지정하고 스캔하세요</h2>
-        <p>하위 폴더까지 검색하여 <b>픽셀 내용</b>이 같은 사진(이름·날짜·EXIF가 달라도)과<br>유사한 사진을 찾아 그룹으로 보여줍니다.</p>
+        <p>하위 폴더까지 검색하여 <b>픽셀 내용</b>이 같은 사진(이름·날짜·EXIF가 달라도)과<br>유사한 사진을 찾아 그룹으로 보여줍니다.<br>동영상은 <b>영상·음성 스트림</b>이 같은지, 주요 장면이 비슷한지로 비교합니다.</p>
       </div>
       <div id="groups" class="groups"></div>
       <div id="more" class="more hidden"><button class="btn ghost" id="btnMore">더 보기</button></div>
@@ -105,7 +107,7 @@
   <!-- 뷰어 -->
   <div id="viewer" class="viewer hidden">
     <button class="v-nav prev" id="vPrev">‹</button>
-    <div class="v-stage" id="vStage"><img id="vImg" alt=""></div>
+    <div class="v-stage" id="vStage"><img id="vImg" alt=""><video id="vVid" class="hidden" controls autoplay></video></div>
     <button class="v-nav next" id="vNext">›</button>
     <div class="v-bar">
       <span id="vInfo"></span>

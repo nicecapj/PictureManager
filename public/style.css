@@ -115,6 +115,7 @@ input:focus, select:focus { border-color: var(--pri); box-shadow: 0 0 0 3px hsla
 .col-h.A { color: var(--a); } .col-h.B { color: var(--b); }
 .col-h em { font-style: normal; font-weight: 400; color: var(--mute); }
 .card .dup { position: absolute; top: 38px; right: 8px; font-size: 11px; padding: 1px 7px; border-radius: 6px; background: hsla(38 95% 60% / .9); color: #1a1205; font-weight: 600; }
+.card .vid { position: absolute; top: 10px; left: 40px; font-size: 11px; padding: 1px 7px; border-radius: 6px; background: hsla(230 30% 5% / .75); color: #fff; font-weight: 600; backdrop-filter: blur(6px); }
 .card .dupl { color: var(--warn); }
 
 /* 진행 오버레이 */
@@ -150,7 +151,7 @@ input:focus, select:focus { border-color: var(--pri); box-shadow: 0 0 0 3px hsla
 .diff-head { display: flex; gap: 8px; padding: 12px; border-bottom: 1px solid var(--line); align-items: center; }
 .diff-body { flex: 1; display: flex; gap: 8px; padding: 8px; min-height: 0; position: relative; }
 .diff-body .pane { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #05060a; border-radius: 10px; overflow: hidden; }
-.diff-body .pane img { flex: 1; min-height: 0; object-fit: contain; width: 100%; }
+.diff-body .pane img, .diff-body .pane video { flex: 1; min-height: 0; object-fit: contain; width: 100%; }
 .diff-body .pane .cap { padding: 6px 10px; font-size: 12px; color: var(--mute); display: flex; gap: 8px; align-items: center; }
 .overlay { flex: 1; position: relative; background: #05060a; border-radius: 10px; overflow: hidden; }
 .overlay img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
@@ -167,6 +168,7 @@ input:focus, select:focus { border-color: var(--pri); box-shadow: 0 0 0 3px hsla
 .viewer { position: fixed; inset: 0; background: hsla(230 30% 2% / .96); z-index: 60; display: flex; align-items: center; animation: fade .2s; }
 .v-stage { flex: 1; height: calc(100% - 56px); overflow: hidden; display: grid; place-items: center; cursor: grab; }
 .v-stage img { max-width: 100%; max-height: 100%; transition: transform .08s; user-select: none; -webkit-user-drag: none; }
+.v-stage video { max-width: 100%; max-height: 100%; background: #000; cursor: default; }
 .v-nav { border: 0; background: transparent; font-size: 60px; color: var(--mute); width: 70px; height: 100%; transition: color .2s, background .2s; }
 .v-nav:hover { color: #fff; background: hsla(230 30% 40% / .1); }
 .v-bar { position: absolute; bottom: 0; left: 0; right: 0; display: flex; gap: 8px; align-items: center; padding: 10px 18px; background: hsla(230 25% 8% / .85); backdrop-filter: blur(10px); font-size: 13px; }

@@ -6,10 +6,14 @@ const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
+const { execFile, spawnSync } = require('child_process');
 
 sharp.cache(false);
 const PORT = process.env.PORT || 3000;
 const IMG_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tif', '.tiff', '.avif', '.heic', '.heif']);
+const VID_EXT = new Set(['.mp4', '.m4v', '.mov', '.avi', '.mkv', '.webm', '.wmv', '.3gp', '.mts', '.m2ts', '.flv', '.mpg', '.mpeg']);
+const isVideo = (p) => VID_EXT.has(path.extname(p).toLowerCase());
+const VID_FRAMES = [0.1, 0.3, 0.5, 0.7, 0.9]; // 유사도 비교용 프레임 위치 (길이 비율)
 const THUMB_DIR = path.join(__dirname, '.cache', 'thumbs');
 fs.mkdirSync(THUMB_DIR, { recursive: true });
 
@@ -34,7 +38,7 @@ async function walk(dir, out = []) {
     if (e.isDirectory()) {
       if (e.name.startsWith('.') || e.name === '_휴지통' || e.name === '삭제예정') continue;
       await walk(p, out);
-    } else if (e.isFile() && IMG_EXT.has(path.extname(e.name).toLowerCase())) out.push(p);
+    } else if (e.isFile() && (IMG_EXT.has(path.extname(e.name).toLowerCase()) || isVideo(e.name))) out.push(p);
   }
   return out;
 }
@@ -66,19 +70,94 @@ function hamming(a, b) {
   return d;
 }
 
-async function analyze(abs) {
-  const buf = await fsp.readFile(abs);
-  const base = () => sharp(buf, { failOn: 'none' }).rotate();
-  // 픽셀 내용 해시 (EXIF/메타데이터/파일정보 무시)
-  const { data, info } = await base().removeAlpha().raw().toBuffer({ resolveWithObject: true });
-  const chash = crypto.createHash('sha1').update(`${info.width}x${info.height}`).update(data).digest('hex');
-  // dHash 64bit (유사 이미지 판정)
-  const g = await base().greyscale().resize(9, 8, { fit: 'fill' }).raw().toBuffer();
+// dHash 64bit (유사 이미지 판정)
+async function dHash(input) {
+  const g = await sharp(input, { failOn: 'none' }).rotate().greyscale().resize(9, 8, { fit: 'fill' }).raw().toBuffer();
   let bits = '';
   for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) bits += g[y * 9 + x] > g[y * 9 + x + 1] ? '1' : '0';
   let dhash = '';
   for (let i = 0; i < 64; i += 4) dhash += parseInt(bits.slice(i, i + 4), 2).toString(16);
-  return { chash, dhash, width: info.width, height: info.height };
+  return dhash;
+}
+
+async function analyzeImage(abs) {
+  const buf = await fsp.readFile(abs);
+  // 픽셀 내용 해시 (EXIF/메타데이터/파일정보 무시)
+  const { data, info } = await sharp(buf, { failOn: 'none' }).rotate().removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  const chash = crypto.createHash('sha1').update(`${info.width}x${info.height}`).update(data).digest('hex');
+  return { chash, dhash: await dHash(buf), width: info.width, height: info.height };
+}
+
+// ---------------- 동영상 (ffmpeg) ----------------
+// FFMPEG_PATH/FFPROBE_PATH 환경변수 → PATH → ffmpeg-static/ffprobe-static 패키지 순으로 찾음
+function findTool(name, envKey, pkg) {
+  if (process.env[envKey]) return process.env[envKey];
+  if (!spawnSync(name, ['-version'], { stdio: 'ignore' }).error) return name;
+  try { const m = require(pkg); return typeof m === 'string' ? m : m.path; } catch { return null; }
+}
+const FFMPEG = findTool('ffmpeg', 'FFMPEG_PATH', 'ffmpeg-static');
+const FFPROBE = findTool('ffprobe', 'FFPROBE_PATH', 'ffprobe-static');
+
+function run(bin, args) {
+  return new Promise((resolve, reject) => {
+    execFile(bin, args, { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
+      if (err) reject(new Error(String(stderr || err.message).trim().split('\n').pop()));
+      else resolve(stdout);
+    });
+  });
+}
+
+async function probe(abs) {
+  const j = JSON.parse(await run(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', abs]));
+  const v = j.streams.find((s) => s.codec_type === 'video' && !s.disposition?.attached_pic);
+  if (!v) throw new Error('영상 스트림 없음');
+  const rot = Math.abs(Number(v.tags?.rotate || v.side_data_list?.find((d) => d.rotation != null)?.rotation || 0)) % 180;
+  const [n, d] = String(v.avg_frame_rate || '0/1').split('/').map(Number);
+  return {
+    width: rot === 90 ? v.height : v.width, height: rot === 90 ? v.width : v.height,
+    duration: Number(j.format.duration || v.duration) || 0,
+    vcodec: v.codec_name, fps: d ? Math.round((n / d) * 100) / 100 : 0,
+    acodec: j.streams.find((s) => s.codec_type === 'audio')?.codec_name || null,
+    bitrate: Number(j.format.bit_rate) || 0, format: j.format.format_name,
+    created: j.format.tags?.creation_time || v.tags?.creation_time || null,
+  };
+}
+
+// 스트림 내용 해시: 컨테이너(mp4/mkv/mov)·메타데이터가 달라도 영상/음성 데이터가 같으면 동일
+async function videoHash(abs) {
+  if (!FFMPEG) return 'file:' + crypto.createHash('sha1').update(await fsp.readFile(abs)).digest('hex');
+  const out = await run(FFMPEG, ['-v', 'error', '-i', abs, '-map', '0:v', '-map', '0:a?', '-c', 'copy', '-f', 'streamhash', '-hash', 'sha256', '-']);
+  return 'vid:' + crypto.createHash('sha1').update(out).digest('hex');
+}
+
+// 지정 위치의 프레임을 PNG로 추출 (회전 자동 적용)
+const frameAt = (abs, t, w) => run(FFMPEG, ['-v', 'error', '-ss', String(t), '-i', abs, '-frames:v', '1', '-an',
+  '-vf', `scale='min(${w},iw)':-2`, '-f', 'image2pipe', '-c:v', 'png', '-']);
+
+async function analyzeVideo(abs) {
+  if (!FFMPEG || !FFPROBE) return { chash: await videoHash(abs), dhash: null, width: 0, height: 0, duration: 0, noFfmpeg: true };
+  const meta = await probe(abs);
+  const chash = await videoHash(abs);
+  // 여러 위치의 프레임 dHash를 이어 붙여 영상 지문으로 사용
+  let dhash = '';
+  for (const r of VID_FRAMES) {
+    const png = await frameAt(abs, (meta.duration * r).toFixed(3), 160);
+    dhash += png.length ? await dHash(png) : '0'.repeat(16);
+  }
+  return { chash, dhash, ...meta };
+}
+
+const analyze = (abs) => (isVideo(abs) ? analyzeVideo(abs) : analyzeImage(abs));
+const contentHash = async (abs) => (isVideo(abs) ? videoHash(abs) : (await analyzeImage(abs)).chash);
+
+// 같은 종류끼리만 비교. 동영상은 프레임당 평균 거리 + 길이가 비슷해야 유사
+function similar(a, b, threshold) {
+  if (!a.dhash || !b.dhash || a.kind !== b.kind || a.dhash.length !== b.dhash.length) return false;
+  if (a.kind === 'video') {
+    if (Math.abs(a.duration - b.duration) > Math.max(1, 0.02 * Math.max(a.duration, b.duration))) return false;
+    return hamming(a.dhash, b.dhash) / VID_FRAMES.length <= threshold;
+  }
+  return hamming(a.dhash, b.dhash) <= threshold;
 }
 
 function score(f) { return [(f.width || 0) * (f.height || 0), f.size, f.mtime]; }
@@ -105,11 +184,11 @@ async function runScan(roots, threshold) {
         files.push({
           id: files.length, root: key, rootDir: dir, abs,
           rel: path.relative(dir, abs), name: path.basename(abs),
-          size: st.size, mtime: st.mtimeMs, ctime: st.birthtimeMs,
+          size: st.size, mtime: st.mtimeMs, ctime: st.birthtimeMs, kind: isVideo(abs) ? 'video' : 'image',
         });
       }
     }
-    Object.assign(job, { phase: '이미지 분석 중', total: files.length, startedAt: Date.now(), stats: null });
+    Object.assign(job, { phase: '사진·동영상 분석 중', total: files.length, startedAt: Date.now(), stats: null });
     await pool(files, Math.max(2, os.cpus().length - 1), async (f) => {
       job.current = `[${f.root}] ${f.rel}`;
       try { Object.assign(f, await analyze(f.abs)); }
@@ -128,10 +207,9 @@ async function runScan(roots, threshold) {
     const parent = hashGroups.map((_, i) => i);
     const find = (x) => (parent[x] === x ? x : (parent[x] = find(parent[x])));
     for (let i = 0; i < hashGroups.length; i++) {
-      const a = hashGroups[i][0].dhash; if (!a) continue;
+      const a = hashGroups[i][0]; if (!a.dhash) continue;
       for (let j = i + 1; j < hashGroups.length; j++) {
-        const b = hashGroups[j][0].dhash; if (!b) continue;
-        if (hamming(a, b) <= threshold) parent[find(i)] = find(j);
+        if (similar(a, hashGroups[j][0], threshold)) parent[find(i)] = find(j);
       }
     }
     const clusters = new Map();
@@ -180,7 +258,7 @@ async function uniqueDest(dest, chash, used) {
     if (used.has(key)) {
       if (used.get(key) === chash) return null; // 같은 내용 이미 배치됨
     } else if (fs.existsSync(cand)) {
-      try { const a = await analyze(cand); if (a.chash === chash) { used.set(key, chash); return null; } } catch {}
+      try { if ((await contentHash(cand)) === chash) { used.set(key, chash); return null; } } catch {}
     } else { used.set(key, chash); return cand; }
     cand = `${stem} (${n++})${ext}`;
   }
@@ -216,7 +294,7 @@ async function runSync({ target, mode, unchecked, keepMap }) {
   try {
     await fsp.mkdir(target, { recursive: true });
     if (isMove && fs.existsSync(pendingDir)) { // 이전 삭제예정 파일 해시 등록
-      for (const p of await walkAll(pendingDir)) { try { pendingHashes.add((await analyze(p)).chash); } catch {} }
+      for (const p of await walkAll(pendingDir)) { try { pendingHashes.add(await contentHash(p)); } catch {} }
     }
     for (const f of keep) {
       job.current = `[${f.root}] ${f.rel}`;
@@ -316,7 +394,9 @@ app.get('/api/thumb', async (req, res) => {
   const cache = path.join(THUMB_DIR, key + '.webp');
   try {
     if (!fs.existsSync(cache)) {
-      await sharp(f.abs, { failOn: 'none' }).rotate().resize(size, size, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 80 }).toFile(cache);
+      // 동영상은 10% 지점 프레임을 썸네일로
+      const src = f.kind === 'video' ? await frameAt(f.abs, ((f.duration || 0) * 0.1).toFixed(3), size) : f.abs;
+      await sharp(src, { failOn: 'none' }).rotate().resize(size, size, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 80 }).toFile(cache);
     }
     res.set('Cache-Control', 'max-age=86400').sendFile(cache);
   } catch { res.sendStatus(415); }
@@ -326,7 +406,7 @@ app.get('/api/image', async (req, res) => {
   const f = known(req.query.path);
   if (!f) return res.sendStatus(404);
   const ext = path.extname(f.abs).toLowerCase();
-  if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif'].includes(ext)) return res.sendFile(f.abs);
+  if (f.kind === 'video' || ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif'].includes(ext)) return res.sendFile(f.abs); // 동영상은 Range 스트리밍
   try { // 브라우저 미지원 포맷은 변환
     const buf = await sharp(f.abs, { failOn: 'none' }).rotate().jpeg({ quality: 92 }).toBuffer();
     res.type('jpeg').send(buf);
@@ -337,6 +417,7 @@ app.get('/api/meta', async (req, res) => {
   const f = known(req.query.path);
   if (!f) return res.sendStatus(404);
   try {
+    if (f.kind === 'video') return res.json(await probe(f.abs));
     const m = await sharp(f.abs).metadata();
     res.json({ format: m.format, width: m.width, height: m.height, space: m.space, density: m.density, orientation: m.orientation, hasExif: !!m.exif });
   } catch (e) { res.json({ error: e.message }); }
@@ -349,4 +430,7 @@ app.post('/api/open', (req, res) => { // 탐색기에서 위치 열기
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => console.log(`\n  📷 Picture Manager 실행 중 →  http://localhost:${PORT}\n`));
+app.get('/api/info', (req, res) => res.json({ ffmpeg: !!(FFMPEG && FFPROBE) }));
+
+app.listen(PORT, () => console.log(`\n  📷 Picture Manager 실행 중 →  http://localhost:${PORT}\n` +
+  (FFMPEG && FFPROBE ? '' : '  ⚠ ffmpeg/ffprobe 를 찾을 수 없어 동영상은 파일 바이트 비교만 합니다 (FFMPEG_PATH 지정 또는 PATH 추가)\n')));

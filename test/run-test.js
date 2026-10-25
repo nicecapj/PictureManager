@@ -2,10 +2,14 @@
 const sharp = require('sharp');
 const fs = require('fs');
 const path = require('path');
+const { execFileSync, spawnSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..', 'sample_data');
 const A = path.join(ROOT, 'A'), B = path.join(ROOT, 'B'), C = path.join(ROOT, 'C');
 const BASE = `http://localhost:${process.env.PORT || 3000}`;
+const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
+const HAS_FFMPEG = !spawnSync(FFMPEG, ['-version'], { stdio: 'ignore' }).error;
+const ff = (...args) => execFileSync(FFMPEG, ['-v', 'error', '-y', ...args]);
 
 const svg = (h1, h2, shape) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600">
   <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl(${h1},80%,55%)"/><stop offset="1" stop-color="hsl(${h2},80%,35%)"/></linearGradient></defs>
@@ -51,6 +55,16 @@ async function makeSamples() {
   await put(`${B}/deep/sub/folder/only_in_B.webp`, img(7).webp());
   // 7) 깨진 파일
   fs.writeFileSync(`${B}/broken.jpg`, 'not an image');
+  if (!HAS_FFMPEG) return;
+  // 8) 동영상: 컨테이너만 다른 동일 영상 (mp4 → mkv 리먹싱 + 메타데이터 변경)
+  fs.mkdirSync(`${A}/videos`, { recursive: true }); fs.mkdirSync(`${B}/영상`, { recursive: true }); fs.mkdirSync(`${B}/small`, { recursive: true });
+  ff('-f', 'lavfi', '-i', 'testsrc2=s=320x240:d=3:r=25', '-f', 'lavfi', '-i', 'sine=d=3', '-c:v', 'libx264', '-c:a', 'aac', '-shortest', `${A}/videos/clip.mp4`);
+  ff('-i', `${A}/videos/clip.mp4`, '-map', '0', '-c', 'copy', '-metadata', 'title=B-copy', `${B}/영상/clip_remux.mkv`);
+  // 9) 유사 동영상 (축소 + 재인코딩)
+  ff('-f', 'lavfi', '-i', 'mandelbrot=s=640x480:r=25', '-t', '4', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', `${A}/videos/movie.mp4`);
+  ff('-i', `${A}/videos/movie.mp4`, '-vf', 'scale=320:240', '-c:v', 'libx264', '-crf', '35', `${B}/small/movie_small.mp4`);
+  // 10) B에만 있는 동영상
+  ff('-f', 'lavfi', '-i', 'life=s=320x240:mold=10:r=25:ratio=0.1:death_color=#C83232:life_color=#00ff00', '-t', '3', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', `${B}/영상/only_video.mp4`);
 }
 
 const post = (u, b) => fetch(BASE + u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }).then((r) => r.json());
@@ -80,7 +94,9 @@ function listFiles(dir, out = []) {
   const F = (rel, root) => r.files.find((f) => f.root === root && f.rel.replace(/\\/g, '/') === rel);
   const G = (f) => r.groups[f.groupId];
 
-  assert(r.files.length === 13, `파일 13개 검색 (하위폴더 포함): ${r.files.length}`);
+  const NV = HAS_FFMPEG ? 5 : 0; // 동영상 샘플 수
+  if (!HAS_FFMPEG) console.log('  ⚠ ffmpeg 없음 → 동영상 테스트 생략');
+  assert(r.files.length === 13 + NV, `파일 ${13 + NV}개 검색 (하위폴더 포함): ${r.files.length}`);
   assert(G(F('2023/여행/beach.png', 'A')) === G(F('backup/여행/beach.png', 'B')) && G(F('2023/여행/beach.png', 'A')).type === 'exact', '동일 파일 → 완전 동일');
   assert(G(F('2023/family.png', 'A')).id === G(F('family.png', 'B')).id && G(F('family.png', 'B')).type === 'exact', '날짜/메타데이터만 다름 → 완전 동일');
   assert(G(F('2024/IMG_0001.png', 'A')).id === G(F('phone/renamed_copy.png', 'B')).id, '이름 다르고 내용 같음 → 같은 그룹');
@@ -89,6 +105,20 @@ function listFiles(dir, out = []) {
   assert(sg.id === G(F('small/sunset_small.jpg', 'B')).id && sg.type === 'similar', '리사이즈/재압축 → 유사 그룹');
   assert(F('2024/sunset.jpg', 'A').keep && !F('small/sunset_small.jpg', 'B').keep, '유사 그룹 추천 = 고해상도');
   assert(!!F('broken.jpg', 'B').error, '깨진 파일 오류 처리');
+  if (HAS_FFMPEG) {
+    const vc = G(F('videos/clip.mp4', 'A'));
+    assert(vc.id === G(F('영상/clip_remux.mkv', 'B')).id && vc.type === 'exact', '동영상 리먹싱(mp4→mkv)·메타데이터 변경 → 완전 동일');
+    const vm = G(F('videos/movie.mp4', 'A'));
+    assert(vm.id === G(F('small/movie_small.mp4', 'B')).id && vm.type === 'similar', '동영상 축소/재인코딩 → 유사 그룹');
+    assert(F('videos/movie.mp4', 'A').keep && !F('small/movie_small.mp4', 'B').keep, '유사 동영상 추천 = 고해상도');
+    assert(G(F('영상/only_video.mp4', 'B')).type === 'unique', '다른 동영상 → 고유');
+    assert(r.groups.every((g) => new Set(g.fileIds.map((id) => r.files[id].kind)).size === 1), '사진과 동영상은 섞이지 않음');
+    assert(F('videos/clip.mp4', 'A').duration > 2.9 && F('videos/clip.mp4', 'A').width === 320, '동영상 길이/해상도 추출');
+    const th = await fetch(`${BASE}/api/thumb?path=${encodeURIComponent(F('videos/movie.mp4', 'A').abs)}`);
+    assert(th.ok && th.headers.get('content-type').includes('webp'), '동영상 썸네일 생성');
+    const rg = await fetch(`${BASE}/api/image?path=${encodeURIComponent(F('videos/movie.mp4', 'A').abs)}`, { headers: { Range: 'bytes=0-99' } });
+    assert(rg.status === 206, '동영상 Range 스트리밍');
+  }
 
   console.log('▶ 동기화 (복사, 미체크→_휴지통 제외 테스트는 leave)');
   // 이름 충돌 두 파일 모두 유지
@@ -104,12 +134,13 @@ function listFiles(dir, out = []) {
   assert(out.filter((x) => /family\.png$/.test(x)).length === 1, 'family.png 1개만 존재');
   assert(out.includes('2024/photo.jpg') && out.includes('2024/photo (1).jpg'), '이름 충돌 → photo (1).jpg 로 저장');
   assert(out.includes('deep/sub/folder/only_in_B.webp') && out.includes('2023/여행/beach.png'), '하위폴더 구조 유지');
-  assert(out.length === 8, `총 8개 (중복 제거): ${out.length}`);
+  if (HAS_FFMPEG) assert(out.filter((x) => /clip/.test(x)).length === 1 && out.includes('영상/only_video.mp4'), '동영상 동기화 (동일 영상 1개만)');
+  assert(out.length === 8 + NV - 2, `총 ${8 + NV - 2}개 (중복 제거): ${out.length}`);
 
   console.log('▶ 재동기화 (이미 있는 동일 파일 건너뜀)');
   await post('/api/sync', { target: C, mode: 'copy', unchecked: 'leave', keepMap });
   const l = JSON.parse((await wait()).message);
-  assert(l.copied === 0 && listFiles(C).length === 8, `중복 복사 없음 (skipped ${l.skipped})`);
+  assert(l.copied === 0 && listFiles(C).length === 8 + NV - 2, `중복 복사 없음 (skipped ${l.skipped})`);
 
   console.log('▶ 이동 모드 테스트 (삭제예정 폴더 + 중복 1개만 남김)');
   const C2 = path.join(ROOT, 'C_move');
@@ -125,8 +156,9 @@ function listFiles(dir, out = []) {
   const out2 = walk2(C2).sort();
   console.log('   C_move 결과:', out2);
   const pend = out2.filter((x) => x.startsWith('삭제예정/'));
-  assert(out2.filter((x) => !x.startsWith('삭제예정/')).length === 8, '유지 파일 8개 이동 (중복 그룹은 1개씩)');
-  assert(pend.length === 4 && l2.pending === 4, `삭제예정 4개: ${pend.length}`);
+  const NP = HAS_FFMPEG ? 2 : 0; // 삭제예정으로 가는 동영상 수
+  assert(out2.filter((x) => !x.startsWith('삭제예정/')).length === 8 + NV - NP, `유지 파일 ${8 + NV - NP}개 이동 (중복 그룹은 1개씩)`);
+  assert(pend.length === 4 + NP && l2.pending === 4 + NP, `삭제예정 ${4 + NP}개: ${pend.length}`);
   assert(pend.filter((x) => /beach/.test(x)).length === 1 && l2.dupDeleted === 1, '삭제예정 안의 동일 beach는 1개만 남기고 1개 삭제');
   const leftA = walk2(A).length, leftOrig = [...listFilesAbs(A), ...listFilesAbs(B)];
   assert(leftOrig.length === 1 && leftOrig[0].endsWith('broken.jpg'), `원본에 깨진 파일만 남음: ${leftOrig.length}`);

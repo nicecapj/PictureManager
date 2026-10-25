@@ -10,6 +10,8 @@ const thumb = (f, s = 320) => `/api/thumb?size=${s}&path=${encodeURIComponent(f.
 const full = (f) => `/api/image?path=${encodeURIComponent(f.abs)}`;
 const fmtSize = (b) => (b > 1048576 ? (b / 1048576).toFixed(1) + ' MB' : (b / 1024).toFixed(0) + ' KB');
 const fmtDate = (t) => (t ? new Date(t).toLocaleString('ko-KR', { dateStyle: 'short', timeStyle: 'short' }) : '-');
+const fmtDur = (s) => { s = Math.round(s || 0); const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, x = String(s % 60).padStart(2, '0'); return h ? `${h}:${String(m).padStart(2, '0')}:${x}` : `${m}:${x}`; };
+const isVid = (f) => f.kind === 'video';
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 let data = { files: [], groups: [] };
@@ -59,6 +61,8 @@ $('#brMk').onclick = async () => {
   try { await api('/api/mkdir', { path: p }); brLoad(p); } catch (e) { toast('⚠ ' + e.message); }
 };
 
+api('/api/info').then((i) => { if (!i.ffmpeg) toast('⚠ ffmpeg 를 찾을 수 없어 동영상은 파일 바이트가 같은지만 비교합니다', 8000); }).catch(() => {});
+
 // ---------- 스캔 & 진행 ----------
 const STAT_LABEL = { copied: '복사', moved: '이동', skipped: '중복건너뜀', renamed: '이름변경', pending: '삭제예정', dupDeleted: '중복삭제', trashed: '휴지통', deleted: '삭제' };
 function fmtEta(ms) { const s = Math.round(ms / 1000); return s < 60 ? `${s}초` : `${Math.floor(s / 60)}분 ${s % 60}초`; }
@@ -100,7 +104,7 @@ $('#btnScan').onclick = async () => {
       data = await api('/api/result');
       toast('✅ 스캔 완료 · ' + s.message);
       render();
-    }, '🔍 사진 스캔 · 분석 중…');
+    }, '🔍 사진·동영상 스캔 · 분석 중…');
   } catch (e) { toast('⚠ ' + e.message); }
 };
 
@@ -115,11 +119,13 @@ function groupMatches(g, f) {
     case 'onlyA': return roots.size === 1 && roots.has('A');
     case 'onlyB': return roots.size === 1 && roots.has('B');
     case 'unique': return g.type === 'unique';
+    case 'photo': return files[0].kind !== 'video';
+    case 'video': return files[0].kind === 'video';
     default: return true;
   }
 }
 function updateCounts() {
-  for (const k of ['all', 'exact', 'similar', 'conflict', 'onlyA', 'onlyB', 'unique'])
+  for (const k of ['all', 'exact', 'similar', 'conflict', 'onlyA', 'onlyB', 'unique', 'photo', 'video'])
     $('#cnt-' + k).textContent = data.groups.filter((g) => groupMatches(g, k)).length;
   const keep = data.files.filter((f) => f.keep).length;
   $('#selStat').innerHTML = `유지 <b style="color:var(--c)">${keep}</b> / 전체 ${data.files.length}`;
@@ -195,13 +201,14 @@ function cardHtml(f, isBest, others = []) {
     <span class="chk">${f.keep ? '✓' : ''}</span>
     <span class="root ${f.root}">${f.root}</span>
     ${isBest ? '<span class="best">★ 추천</span>' : ''}
+    ${isVid(f) ? `<span class="vid">▶ ${fmtDur(f.duration)}</span>` : ''}
     ${others.length ? `<span class="dup" title="같은 폴더 안의 동일 파일:\n${esc(dupTip)}">동일 ×${others.length + 1}</span>` : ''}
     <button class="btn ghost sm zoom" data-act="view">🔍</button>
     <div class="info">
       <div class="name">${esc(f.name)}</div>
       <div class="rel">${esc(f.rel)}</div>
       ${others.length ? `<div class="rel dupl">+ ${others.map((o) => esc(o.rel)).join(', ')}</div>` : ''}
-      ${f.error ? `<div class="err">읽기 실패</div>` : `<div class="sub">${f.width}×${f.height} · ${fmtSize(f.size)} · ${fmtDate(f.mtime)}</div>`}
+      ${f.error ? `<div class="err">읽기 실패</div>` : `<div class="sub">${f.width ? `${f.width}×${f.height} · ` : ''}${isVid(f) && f.vcodec ? `${f.vcodec} · ` : ''}${fmtSize(f.size)} · ${fmtDate(f.mtime)}</div>`}
     </div></div>`;
 }
 function setKeep(id, v) {
@@ -254,7 +261,8 @@ function renderDiff() {
   const body = $('#diffBody');
   const keepBtn = (f) => `<button class="btn sm ${f.keep ? 'primary' : 'ghost'}" data-keep="${f.id}">${f.keep ? '✓ 유지' : '☐ 유지'}</button>`;
   if (mode === 'side') {
-    body.innerHTML = [a, b].map((f, i) => `<div class="pane"><div class="cap">${paneSel(i, f, files)}<span class="sp"></span>${keepBtn(f)}</div><img src="${thumb(f, 1600)}"></div>`).join('');
+    const media = (f) => (isVid(f) ? `<video src="${full(f)}" poster="${thumb(f, 1600)}" controls preload="metadata"></video>` : `<img src="${thumb(f, 1600)}">`);
+    body.innerHTML = [a, b].map((f, i) => `<div class="pane"><div class="cap">${paneSel(i, f, files)}<span class="sp"></span>${keepBtn(f)}</div>${media(f)}</div>`).join('');
   } else {
     body.innerHTML = `<div class="overlay ${mode === 'diff' ? 'diffmode' : ''}">
       <img src="${thumb(a, 1600)}"><img class="top" src="${thumb(b, 1600)}">
@@ -269,7 +277,12 @@ function renderDiff() {
     row('용량', fmtSize(a.size), fmtSize(b.size)) +
     row('수정일', fmtDate(a.mtime), fmtDate(b.mtime)) +
     row('생성일', fmtDate(a.ctime), fmtDate(b.ctime)) +
-    row('픽셀 내용', a.chash === b.chash ? '동일' : '다름', a.chash === b.chash ? '동일' : '다름');
+    (isVid(a) || isVid(b) ?
+      row('길이', fmtDur(a.duration), fmtDur(b.duration)) +
+      row('코덱', `${a.vcodec || '-'}${a.acodec ? ' / ' + a.acodec : ''}`, `${b.vcodec || '-'}${b.acodec ? ' / ' + b.acodec : ''}`) +
+      row('FPS', a.fps || '-', b.fps || '-') +
+      row('비트레이트', a.bitrate ? Math.round(a.bitrate / 1000) + ' kbps' : '-', b.bitrate ? Math.round(b.bitrate / 1000) + ' kbps' : '-') : '') +
+    row(isVid(a) ? '스트림 내용' : '픽셀 내용', a.chash === b.chash ? '동일' : '다름', a.chash === b.chash ? '동일' : '다름');
 }
 $('#diffMode').onchange = renderDiff;
 $('#diffBody').onchange = (e) => {
@@ -280,7 +293,7 @@ $('#diffBody').onclick = (e) => {
   const k = e.target.closest('[data-keep]'); if (!k) return;
   setKeep(+k.dataset.keep, !data.files[+k.dataset.keep].keep); renderDiff();
 };
-$('#diffClose').onclick = () => $('#diff').classList.add('hidden');
+$('#diffClose').onclick = () => { $('#diffBody').innerHTML = ''; $('#diff').classList.add('hidden'); };
 
 // ---------- 뷰어 ----------
 let vList = [], vIdx = 0, vZoom = 1, vPan = [0, 0];
@@ -292,20 +305,25 @@ function openViewer(fid) {
 function showV() {
   const f = data.files[vList[vIdx]];
   vZoom = 1; vPan = [0, 0]; applyZ();
-  $('#vImg').src = full(f);
-  $('#vInfo').innerHTML = `<b>[${f.root}]</b> ${esc(f.rel)} · ${f.width}×${f.height} · ${fmtSize(f.size)} · ${fmtDate(f.mtime)} <span style="color:var(--mute)">(${vIdx + 1}/${vList.length})</span>`;
+  const vid = isVid(f);
+  $('#vImg').classList.toggle('hidden', vid); $('#vVid').classList.toggle('hidden', !vid);
+  if (vid) { $('#vImg').removeAttribute('src'); $('#vVid').poster = thumb(f, 1600); $('#vVid').src = full(f); }
+  else { $('#vVid').pause(); $('#vVid').removeAttribute('src'); $('#vVid').load(); $('#vImg').src = full(f); }
+  $('#vInfo').innerHTML = `<b>[${f.root}]</b> ${esc(f.rel)} · ${f.width}×${f.height}${vid ? ` · ${fmtDur(f.duration)}` : ''} · ${fmtSize(f.size)} · ${fmtDate(f.mtime)} <span style="color:var(--mute)">(${vIdx + 1}/${vList.length})</span>`;
   $('#vKeep').textContent = f.keep ? '✓ 유지' : '☐ 유지';
   $('#vKeep').classList.toggle('keep-on', !!f.keep);
 }
 const applyZ = () => ($('#vImg').style.transform = `translate(${vPan[0]}px,${vPan[1]}px) scale(${vZoom})`);
+const vIsVid = () => isVid(data.files[vList[vIdx]]); // 동영상은 확대/이동 대신 기본 재생 컨트롤 사용
 const vMove = (d) => { if (!vList.length) return; vIdx = (vIdx + d + vList.length) % vList.length; showV(); };
 $('#vPrev').onclick = () => vMove(-1);
 $('#vNext').onclick = () => vMove(1);
-$('#vClose').onclick = () => $('#viewer').classList.add('hidden');
+$('#vClose').onclick = () => { $('#vVid').pause(); $('#viewer').classList.add('hidden'); };
 $('#vKeep').onclick = () => { const id = vList[vIdx]; setKeep(id, !data.files[id].keep); showV(); };
 $('#vOpen').onclick = () => api('/api/open', { path: data.files[vList[vIdx]].abs });
-$('#vStage').onwheel = (e) => { e.preventDefault(); vZoom = Math.min(10, Math.max(0.2, vZoom * (e.deltaY < 0 ? 1.15 : 0.87))); applyZ(); };
+$('#vStage').onwheel = (e) => { if (vIsVid()) return; e.preventDefault(); vZoom = Math.min(10, Math.max(0.2, vZoom * (e.deltaY < 0 ? 1.15 : 0.87))); applyZ(); };
 $('#vStage').onmousedown = (e) => {
+  if (vIsVid()) return;
   const s = [e.clientX - vPan[0], e.clientY - vPan[1]];
   const mv = (m) => { vPan = [m.clientX - s[0], m.clientY - s[1]]; applyZ(); };
   window.addEventListener('mousemove', mv);
@@ -317,7 +335,7 @@ document.addEventListener('keydown', (e) => {
     else if (e.key === 'ArrowRight') vMove(1);
     else if (e.key === 'Escape') $('#vClose').click();
     else if (e.key === ' ') { e.preventDefault(); $('#vKeep').click(); }
-  } else if (e.key === 'Escape') { $('#diff').classList.add('hidden'); $('#browser').classList.add('hidden'); }
+  } else if (e.key === 'Escape') { $('#diffClose').click(); $('#browser').classList.add('hidden'); }
 });
 
 // ---------- 동기화 ----------
