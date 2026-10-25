@@ -1,0 +1,13 @@
+{
+  "name": "picture-manager",
+  "version": "1.0.0",
+  "description": "사진 Diff & 동기화 관리자 (localhost 웹앱)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "sharp": "^0.33.5"
+  }
+}
