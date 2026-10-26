@@ -7,9 +7,14 @@ const { execFileSync, spawnSync } = require('child_process');
 const ROOT = path.join(__dirname, '..', 'sample_data');
 const A = path.join(ROOT, 'A'), B = path.join(ROOT, 'B'), C = path.join(ROOT, 'C');
 const BASE = `http://localhost:${process.env.PORT || 3000}`;
-const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
-const HAS_FFMPEG = !spawnSync(FFMPEG, ['-version'], { stdio: 'ignore' }).error;
-const ff = (...args) => execFileSync(FFMPEG, ['-v', 'error', '-y', ...args]);
+function findFfmpeg() {
+  if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH;
+  if (!spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' }).error) return 'ffmpeg';
+  try { const m = require('ffmpeg-static'); return typeof m === 'string' ? m : m.path; } catch { return null; }
+}
+const FFMPEG = findFfmpeg();
+const HAS_FFMPEG = !!FFMPEG;
+const ff = (...args) => execFileSync(FFMPEG, ['-nostdin', '-v', 'error', '-y', ...args]);
 
 const svg = (h1, h2, shape) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600">
   <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl(${h1},80%,55%)"/><stop offset="1" stop-color="hsl(${h2},80%,35%)"/></linearGradient></defs>

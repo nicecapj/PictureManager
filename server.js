@@ -14,8 +14,29 @@ const IMG_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tif
 const VID_EXT = new Set(['.mp4', '.m4v', '.mov', '.avi', '.mkv', '.webm', '.wmv', '.3gp', '.mts', '.m2ts', '.flv', '.mpg', '.mpeg']);
 const isVideo = (p) => VID_EXT.has(path.extname(p).toLowerCase());
 const VID_FRAMES = [0.1, 0.3, 0.5, 0.7, 0.9]; // 유사도 비교용 프레임 위치 (길이 비율)
-const THUMB_DIR = path.join(__dirname, '.cache', 'thumbs');
+const CACHE_DIR = path.join(__dirname, '.cache');
+const THUMB_DIR = path.join(CACHE_DIR, 'thumbs');
+const META_CACHE_FILE = path.join(CACHE_DIR, 'analysis.json');
 fs.mkdirSync(THUMB_DIR, { recursive: true });
+
+// 파일 분석 캐시 (경로|크기|수정시간 → 분석 결과) : 재스캔·동기화 시 반복 디코딩/ffmpeg 호출 방지
+const analysisCache = new Map();
+try {
+  if (fs.existsSync(META_CACHE_FILE)) {
+    for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(META_CACHE_FILE, 'utf8')))) analysisCache.set(k, v);
+  }
+} catch {}
+const cacheKey = (abs, size, mtime) => `${path.resolve(abs).toLowerCase()}|${size}|${Math.floor(mtime)}`;
+function saveAnalysisCache() {
+  try {
+    if (analysisCache.size > 20000) {
+      const drop = analysisCache.size - 15000;
+      let i = 0;
+      for (const k of analysisCache.keys()) { if (i++ >= drop) break; analysisCache.delete(k); }
+    }
+    fs.writeFileSync(META_CACHE_FILE, JSON.stringify(Object.fromEntries(analysisCache)));
+  } catch {}
+}
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -23,7 +44,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ---------------- 상태 ----------------
 let state = {
-  job: { running: false, phase: 'idle', done: 0, total: 0, message: '' },
+  job: { running: false, phase: 'idle', done: 0, total: 0, message: '', cancelled: false },
   files: [],      // {id, root, rel, abs, name, size, mtime, width, height, chash, dhash, error}
   groups: [],     // {id, type: exact|similar|unique, fileIds, nameConflict}
   roots: {},
@@ -44,7 +65,9 @@ async function walk(dir, out = []) {
 }
 
 async function walkAll(dir, out = []) {
-  for (const e of await fsp.readdir(dir, { withFileTypes: true })) {
+  let entries;
+  try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
     const p = path.join(dir, e.name);
     if (e.isDirectory()) await walkAll(p, out); else out.push(p);
   }
@@ -54,7 +77,7 @@ async function walkAll(dir, out = []) {
 async function pool(items, n, fn, onProgress) {
   let i = 0;
   const workers = Array.from({ length: n }, async () => {
-    while (i < items.length) {
+    while (i < items.length && !state.job.cancelled) {
       const idx = i++;
       await fn(items[idx], idx);
       onProgress && onProgress();
@@ -80,12 +103,40 @@ async function dHash(input) {
   return dhash;
 }
 
-async function analyzeImage(abs) {
-  const buf = await fsp.readFile(abs);
+async function imageChash(buf) {
   // 픽셀 내용 해시 (EXIF/메타데이터/파일정보 무시)
   const { data, info } = await sharp(buf, { failOn: 'none' }).rotate().removeAlpha().raw().toBuffer({ resolveWithObject: true });
   const chash = crypto.createHash('sha1').update(`${info.width}x${info.height}`).update(data).digest('hex');
-  return { chash, dhash: await dHash(buf), width: info.width, height: info.height };
+  return { chash, width: info.width, height: info.height };
+}
+
+async function analyzeImage(abs) {
+  const buf = await fsp.readFile(abs);
+  const { chash, width, height } = await imageChash(buf);
+  return { chash, dhash: await dHash(buf), width, height };
+}
+
+// 대용량 파일 전체를 메모리에 올리지 않고 앞·중간·뒤 64KB 샘플 + 파일 크기로 빠른 해시 생성
+async function fastFileHash(abs) {
+  const fh = await fsp.open(abs, 'r');
+  try {
+    const st = await fh.stat();
+    const h = crypto.createHash('sha1').update(`size:${st.size}|`);
+    const chunk = 65536;
+    const buf = Buffer.allocUnsafe(Math.min(chunk, Math.max(1, st.size)));
+    const offsets = st.size <= chunk * 3
+      ? [0, chunk, chunk * 2].filter((o) => o < st.size)
+      : [0, Math.floor((st.size - chunk) / 2), Math.max(0, st.size - chunk)];
+    for (const off of offsets) {
+      const len = Math.min(buf.length, st.size - off);
+      if (len <= 0) continue;
+      const { bytesRead } = await fh.read(buf, 0, len, off);
+      h.update(buf.subarray(0, bytesRead));
+    }
+    return h.digest('hex');
+  } finally {
+    await fh.close();
+  }
 }
 
 // ---------------- 동영상 (ffmpeg) ----------------
@@ -98,57 +149,157 @@ function findTool(name, envKey, pkg) {
 const FFMPEG = findTool('ffmpeg', 'FFMPEG_PATH', 'ffmpeg-static');
 const FFPROBE = findTool('ffprobe', 'FFPROBE_PATH', 'ffprobe-static');
 
-function run(bin, args) {
+// 동시 실행 ffmpeg/ffprobe 프로세스 수 제한 및 타임아웃/강제종료 관리 (무한 대기 및 디스크 병목 방지)
+const MAX_FF = Math.min(4, Math.max(2, Math.floor(os.cpus().length / 2)));
+let activeFfCount = 0;
+const ffQueue = [];
+const activeProcs = new Set();
+
+function withFfLimit(fn) {
   return new Promise((resolve, reject) => {
-    execFile(bin, args, { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
-      if (err) reject(new Error(String(stderr || err.message).trim().split('\n').pop()));
-      else resolve(stdout);
-    });
+    const next = () => {
+      activeFfCount++;
+      fn().then(resolve, reject).finally(() => {
+        activeFfCount--;
+        if (ffQueue.length) ffQueue.shift()();
+      });
+    };
+    if (activeFfCount < MAX_FF) next();
+    else ffQueue.push(next);
   });
 }
 
+function killActiveProcs() {
+  for (const p of activeProcs) {
+    try { p.kill('SIGKILL'); } catch {}
+  }
+  activeProcs.clear();
+}
+
+function run(bin, args, timeoutMs = 30000) {
+  const fullArgs = bin === FFMPEG && args[0] !== '-nostdin' ? ['-nostdin', ...args] : args;
+  return withFfLimit(() => new Promise((resolve, reject) => {
+    if (state.job.cancelled) return reject(new Error('작업 취소됨'));
+    const child = execFile(bin, fullArgs, {
+      encoding: 'buffer',
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      windowsHide: true,
+    }, (err, stdout, stderr) => {
+      activeProcs.delete(child);
+      if (err) {
+        const msg = err.killed ? `시간 초과 (${Math.round(timeoutMs / 1000)}초)` : String(stderr || err.message).trim().split('\n').pop();
+        reject(new Error(msg || '실행 실패'));
+      } else resolve(stdout);
+    });
+    activeProcs.add(child);
+    try { child.stdin?.end(); } catch {}
+  }));
+}
+
 async function probe(abs) {
-  const j = JSON.parse(await run(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', abs]));
-  const v = j.streams.find((s) => s.codec_type === 'video' && !s.disposition?.attached_pic);
+  const j = JSON.parse(await run(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', abs], 15000));
+  const v = j.streams?.find((s) => s.codec_type === 'video' && !s.disposition?.attached_pic);
   if (!v) throw new Error('영상 스트림 없음');
   const rot = Math.abs(Number(v.tags?.rotate || v.side_data_list?.find((d) => d.rotation != null)?.rotation || 0)) % 180;
   const [n, d] = String(v.avg_frame_rate || '0/1').split('/').map(Number);
   return {
     width: rot === 90 ? v.height : v.width, height: rot === 90 ? v.width : v.height,
-    duration: Number(j.format.duration || v.duration) || 0,
+    duration: Number(j.format?.duration || v.duration) || 0,
     vcodec: v.codec_name, fps: d ? Math.round((n / d) * 100) / 100 : 0,
     acodec: j.streams.find((s) => s.codec_type === 'audio')?.codec_name || null,
-    bitrate: Number(j.format.bit_rate) || 0, format: j.format.format_name,
-    created: j.format.tags?.creation_time || v.tags?.creation_time || null,
+    bitrate: Number(j.format?.bit_rate) || 0, format: j.format?.format_name,
+    created: j.format?.tags?.creation_time || v.tags?.creation_time || null,
   };
 }
 
 // 스트림 내용 해시: 컨테이너(mp4/mkv/mov)·메타데이터가 달라도 영상/음성 데이터가 같으면 동일
+// 대용량 영상 전체를 끝까지 읽느라 멈추지 않도록 앞부분 15초 스트림 패킷을 해시
 async function videoHash(abs) {
-  if (!FFMPEG) return 'file:' + crypto.createHash('sha1').update(await fsp.readFile(abs)).digest('hex');
-  const out = await run(FFMPEG, ['-v', 'error', '-i', abs, '-map', '0:v', '-map', '0:a?', '-c', 'copy', '-f', 'streamhash', '-hash', 'sha256', '-']);
-  return 'vid:' + crypto.createHash('sha1').update(out).digest('hex');
+  if (!FFMPEG) return 'file:' + await fastFileHash(abs);
+  try {
+    const out = await run(FFMPEG, [
+      '-v', 'error', '-i', abs, '-t', '15',
+      '-map', '0:v:0', '-map', '0:a:0?',
+      '-c', 'copy', '-f', 'streamhash', '-hash', 'sha256', '-',
+    ], 20000);
+    if (out && out.length) return 'vid:' + crypto.createHash('sha1').update(out).digest('hex');
+  } catch {}
+  return 'file:' + await fastFileHash(abs);
 }
 
-// 지정 위치의 프레임을 PNG로 추출 (회전 자동 적용)
-const frameAt = (abs, t, w) => run(FFMPEG, ['-v', 'error', '-ss', String(t), '-i', abs, '-frames:v', '1', '-an',
-  '-vf', `scale='min(${w},iw)':-2`, '-f', 'image2pipe', '-c:v', 'png', '-']);
+// 지정 위치의 프레임을 PNG로 추출 (회전 자동 적용, EOF 탐색 실패 시 0초 프레임으로 폴백)
+async function frameAt(abs, t, w) {
+  try {
+    const out = await run(FFMPEG, ['-v', 'error', '-ss', String(t), '-i', abs, '-frames:v', '1', '-an',
+      '-vf', `scale='min(${w},iw)':-2`, '-f', 'image2pipe', '-c:v', 'png', '-'], 15000);
+    if (out && out.length) return out;
+  } catch {}
+  if (Number(t) > 0) {
+    try {
+      const out = await run(FFMPEG, ['-v', 'error', '-i', abs, '-frames:v', '1', '-an',
+        '-vf', `scale='min(${w},iw)':-2`, '-f', 'image2pipe', '-c:v', 'png', '-'], 15000);
+      if (out && out.length) return out;
+    } catch {}
+  }
+  return Buffer.alloc(0);
+}
 
-async function analyzeVideo(abs) {
+function thumbCachePath(abs, mtime, size = 320) {
+  const key = crypto.createHash('md5').update(`${abs}|${mtime}|${size}`).digest('hex');
+  return path.join(THUMB_DIR, key + '.webp');
+}
+
+async function analyzeVideo(abs, mtime) {
   if (!FFMPEG || !FFPROBE) return { chash: await videoHash(abs), dhash: null, width: 0, height: 0, duration: 0, noFfmpeg: true };
-  const meta = await probe(abs);
-  const chash = await videoHash(abs);
+  const [meta, chash] = await Promise.all([probe(abs), videoHash(abs)]);
   // 여러 위치의 프레임 dHash를 이어 붙여 영상 지문으로 사용
   let dhash = '';
-  for (const r of VID_FRAMES) {
-    const png = await frameAt(abs, (meta.duration * r).toFixed(3), 160);
+  for (let idx = 0; idx < VID_FRAMES.length; idx++) {
+    const r = VID_FRAMES[idx];
+    const w = idx === 0 ? 320 : 160;
+    const png = await frameAt(abs, ((meta.duration || 0) * r).toFixed(3), w);
     dhash += png.length ? await dHash(png) : '0'.repeat(16);
+    // 첫 프레임(10%) 추출 시 기본 썸네일(320px)도 미리 캐싱해 UI 렌더링 시 재추출 방지
+    if (idx === 0 && png.length && mtime) {
+      const tc = thumbCachePath(abs, mtime, 320);
+      if (!fs.existsSync(tc)) {
+        sharp(png, { failOn: 'none' }).rotate().resize(320, 320, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 80 }).toFile(tc).catch(() => {});
+      }
+    }
   }
   return { chash, dhash, ...meta };
 }
 
-const analyze = (abs) => (isVideo(abs) ? analyzeVideo(abs) : analyzeImage(abs));
-const contentHash = async (abs) => (isVideo(abs) ? videoHash(abs) : (await analyzeImage(abs)).chash);
+async function analyzeWithCache(f) {
+  const key = cacheKey(f.abs, f.size, f.mtime);
+  const cached = analysisCache.get(key);
+  if (cached && cached.chash && cached.dhash !== undefined && (!isVideo(f.abs) || !FFMPEG || !cached.noFfmpeg)) {
+    return cached;
+  }
+  const res = isVideo(f.abs) ? await analyzeVideo(f.abs, f.mtime) : await analyzeImage(f.abs);
+  analysisCache.set(key, res);
+  return res;
+}
+
+async function contentHash(abs) {
+  const knownFile = state.files.find((f) => f.abs === abs && f.chash && !f.error);
+  if (knownFile) return knownFile.chash;
+  const st = await fsp.stat(abs);
+  const key = cacheKey(abs, st.size, st.mtimeMs);
+  const cached = analysisCache.get(key);
+  if (cached && cached.chash && (!isVideo(abs) || !FFMPEG || !cached.noFfmpeg)) return cached.chash;
+  if (isVideo(abs)) {
+    const chash = await videoHash(abs);
+    analysisCache.set(key, { ...(cached || {}), chash });
+    return chash;
+  }
+  const buf = await fsp.readFile(abs);
+  const { chash, width, height } = await imageChash(buf);
+  analysisCache.set(key, { ...(cached || {}), chash, width, height });
+  return chash;
+}
 
 // 같은 종류끼리만 비교. 동영상은 프레임당 평균 거리 + 길이가 비슷해야 유사
 function similar(a, b, threshold) {
@@ -172,7 +323,7 @@ function best(files) {
 // ---------------- 스캔 ----------------
 async function runScan(roots, threshold) {
   const job = state.job;
-  Object.assign(job, { running: true, phase: '파일 검색 중', done: 0, total: 0, message: '' });
+  Object.assign(job, { running: true, cancelled: false, phase: '파일 검색 중', done: 0, total: 0, message: '', current: '' });
   state.roots = roots;
   try {
     const files = [];
@@ -180,7 +331,9 @@ async function runScan(roots, threshold) {
       if (!dir) continue;
       const list = await walk(dir);
       for (const abs of list) {
-        const st = await fsp.stat(abs);
+        if (job.cancelled) throw new Error('작업이 취소되었습니다');
+        let st;
+        try { st = await fsp.stat(abs); } catch { continue; }
         files.push({
           id: files.length, root: key, rootDir: dir, abs,
           rel: path.relative(dir, abs), name: path.basename(abs),
@@ -189,11 +342,15 @@ async function runScan(roots, threshold) {
       }
     }
     Object.assign(job, { phase: '사진·동영상 분석 중', total: files.length, startedAt: Date.now(), stats: null });
-    await pool(files, Math.max(2, os.cpus().length - 1), async (f) => {
+    const concurrency = Math.min(8, Math.max(2, os.cpus().length - 1));
+    await pool(files, concurrency, async (f) => {
       job.current = `[${f.root}] ${f.rel}`;
-      try { Object.assign(f, await analyze(f.abs)); }
+      try { Object.assign(f, await analyzeWithCache(f)); }
       catch (e) { f.error = String(e.message || e); f.chash = 'err:' + f.abs; f.dhash = null; }
     }, () => job.done++);
+
+    if (job.cancelled) throw new Error('작업이 취소되었습니다');
+    saveAnalysisCache();
 
     job.phase = '그룹 분류 중';
     // 1) 내용 해시로 묶기
@@ -250,6 +407,17 @@ async function runScan(roots, threshold) {
 }
 
 // ---------------- 동기화 ----------------
+async function recordDestCache(dest, f) {
+  try {
+    const st = await fsp.stat(dest);
+    analysisCache.set(cacheKey(dest, st.size, st.mtimeMs), {
+      chash: f.chash, dhash: f.dhash, width: f.width, height: f.height,
+      duration: f.duration, vcodec: f.vcodec, fps: f.fps, acodec: f.acodec,
+      bitrate: f.bitrate, format: f.format, created: f.created,
+    });
+  } catch {}
+}
+
 async function uniqueDest(dest, chash, used) {
   const ext = path.extname(dest), stem = dest.slice(0, -ext.length);
   let cand = dest, n = 1;
@@ -258,7 +426,13 @@ async function uniqueDest(dest, chash, used) {
     if (used.has(key)) {
       if (used.get(key) === chash) return null; // 같은 내용 이미 배치됨
     } else if (fs.existsSync(cand)) {
-      try { if ((await contentHash(cand)) === chash) { used.set(key, chash); return null; } } catch {}
+      try {
+        const existingHash = await contentHash(cand);
+        used.set(key, existingHash);
+        if (existingHash === chash) return null;
+      } catch {
+        used.set(key, 'err:' + key);
+      }
     } else { used.set(key, chash); return cand; }
     cand = `${stem} (${n++})${ext}`;
   }
@@ -267,7 +441,12 @@ async function uniqueDest(dest, chash, used) {
 async function moveFile(src, dst) {
   await fsp.mkdir(path.dirname(dst), { recursive: true });
   try { await fsp.rename(src, dst); }
-  catch { await fsp.copyFile(src, dst); await fsp.unlink(src); }
+  catch {
+    const st = await fsp.stat(src);
+    await fsp.copyFile(src, dst);
+    await fsp.utimes(dst, st.atime, st.mtime).catch(() => {});
+    await fsp.unlink(src);
+  }
 }
 
 async function runSync({ target, mode, unchecked, keepMap }) {
@@ -276,7 +455,10 @@ async function runSync({ target, mode, unchecked, keepMap }) {
   const keep = state.files.filter((f) => f.keep && !f.error);
   const drop = state.files.filter((f) => !f.keep && !f.error);
   const isMove = mode === 'move';
-  Object.assign(job, { running: true, phase: '동기화 중', done: 0, total: keep.length + (isMove || unchecked !== 'leave' ? drop.length : 0), message: '' });
+  Object.assign(job, {
+    running: true, cancelled: false, phase: '동기화 중',
+    done: 0, total: keep.length + (isMove || unchecked !== 'leave' ? drop.length : 0), message: '',
+  });
   const log = { copied: 0, moved: 0, skipped: 0, renamed: 0, deleted: 0, trashed: 0, pending: 0, dupDeleted: 0, errors: [] };
   job.stats = log; job.current = ''; job.startedAt = Date.now();
   const used = new Map();
@@ -285,48 +467,79 @@ async function runSync({ target, mode, unchecked, keepMap }) {
   const pendingHashes = new Set();
   const pendingUsed = new Map();
   async function toPending(f) {
+    if (!fs.existsSync(f.abs)) return;
     if (pendingHashes.has(f.chash)) { await fsp.unlink(f.abs); log.dupDeleted++; return; }
     pendingHashes.add(f.chash);
     const dest = await uniqueDest(path.join(pendingDir, f.root, f.rel), f.chash, pendingUsed);
     if (!dest) { await fsp.unlink(f.abs); log.dupDeleted++; return; } // 이미 삭제예정에 동일 파일 존재
-    await moveFile(f.abs, dest); log.pending++;
+    await moveFile(f.abs, dest);
+    await recordDestCache(dest, f);
+    log.pending++;
   }
   try {
     await fsp.mkdir(target, { recursive: true });
     if (isMove && fs.existsSync(pendingDir)) { // 이전 삭제예정 파일 해시 등록
-      for (const p of await walkAll(pendingDir)) { try { pendingHashes.add(await contentHash(p)); } catch {} }
+      job.current = '기존 삭제예정 폴더 확인 중…';
+      for (const p of await walkAll(pendingDir)) {
+        if (job.cancelled) throw new Error('작업이 취소되었습니다');
+        try { pendingHashes.add(await contentHash(p)); } catch {}
+      }
     }
     for (const f of keep) {
+      if (job.cancelled) throw new Error('작업이 취소되었습니다');
       job.current = `[${f.root}] ${f.rel}`;
       try {
+        if (!fs.existsSync(f.abs)) { log.skipped++; job.done++; continue; }
         const dest = await uniqueDest(path.join(target, f.rel), f.chash, used);
         if (!dest) { log.skipped++; if (isMove) await toPending(f); }
         else {
           if (dest !== path.join(target, f.rel)) log.renamed++;
-          if (mode === 'move') { await moveFile(f.abs, dest); log.moved++; }
-          else { await fsp.mkdir(path.dirname(dest), { recursive: true }); await fsp.copyFile(f.abs, dest); const st = await fsp.stat(f.abs); await fsp.utimes(dest, st.atime, st.mtime); log.copied++; }
+          if (mode === 'move') {
+            await moveFile(f.abs, dest);
+            await recordDestCache(dest, f);
+            log.moved++;
+          } else {
+            await fsp.mkdir(path.dirname(dest), { recursive: true });
+            await fsp.copyFile(f.abs, dest);
+            const st = await fsp.stat(f.abs);
+            await fsp.utimes(dest, st.atime, st.mtime).catch(() => {});
+            await recordDestCache(dest, f);
+            log.copied++;
+          }
         }
       } catch (e) { log.errors.push(`${f.abs}: ${e.message}`); }
       job.done++;
     }
     if (isMove) {
       for (const f of drop) {
+        if (job.cancelled) throw new Error('작업이 취소되었습니다');
         job.current = `[${f.root}] ${f.rel}`;
         try { await toPending(f); } catch (e) { log.errors.push(`${f.abs}: ${e.message}`); }
         job.done++;
       }
     } else if (unchecked !== 'leave') {
       for (const f of drop) {
+        if (job.cancelled) throw new Error('작업이 취소되었습니다');
         job.current = `[${f.root}] ${f.rel}`;
         try {
-          if (unchecked === 'trash') { await moveFile(f.abs, path.join(target, '_휴지통', f.root, f.rel)); log.trashed++; }
-          else if (unchecked === 'delete') { await fsp.unlink(f.abs); log.deleted++; }
+          if (!fs.existsSync(f.abs)) { job.done++; continue; }
+          if (unchecked === 'trash') {
+            const trashDest = path.join(target, '_휴지통', f.root, f.rel);
+            await moveFile(f.abs, trashDest);
+            await recordDestCache(trashDest, f);
+            log.trashed++;
+          } else if (unchecked === 'delete') {
+            await fsp.unlink(f.abs);
+            log.deleted++;
+          }
         } catch (e) { log.errors.push(`${f.abs}: ${e.message}`); }
         job.done++;
       }
     }
+    saveAnalysisCache();
     Object.assign(job, { running: false, phase: 'synced', message: JSON.stringify(log) });
   } catch (e) {
+    saveAnalysisCache();
     Object.assign(job, { running: false, phase: 'error', message: String(e.message || e) });
   }
 }
@@ -367,6 +580,14 @@ app.post('/api/scan', (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/cancel', (req, res) => {
+  if (state.job.running) {
+    state.job.cancelled = true;
+    killActiveProcs();
+  }
+  res.json({ ok: true });
+});
+
 app.get('/api/status', (req, res) => res.json(state.job));
 
 app.get('/api/result', (req, res) => {
@@ -381,7 +602,11 @@ app.post('/api/sync', (req, res) => {
   if (state.job.running) return res.status(409).json({ error: '작업 진행 중' });
   if (!req.body.target) return res.status(400).json({ error: '대상 폴더를 지정하세요' });
   const t = path.resolve(req.body.target);
-  for (const r of Object.values(state.roots)) if (r && path.resolve(r) === t) return res.status(400).json({ error: '대상 폴더는 원본 폴더와 달라야 합니다' });
+  for (const r of Object.values(state.roots)) {
+    if (!r) continue;
+    const rp = path.resolve(r);
+    if (rp.toLowerCase() === t.toLowerCase()) return res.status(400).json({ error: '대상 폴더는 원본 폴더와 달라야 합니다' });
+  }
   runSync(req.body);
   res.json({ ok: true });
 });
@@ -390,12 +615,12 @@ app.get('/api/thumb', async (req, res) => {
   const f = known(req.query.path);
   if (!f) return res.sendStatus(404);
   const size = Math.min(Number(req.query.size) || 320, 1600);
-  const key = crypto.createHash('md5').update(`${f.abs}|${f.mtime}|${size}`).digest('hex');
-  const cache = path.join(THUMB_DIR, key + '.webp');
+  const cache = thumbCachePath(f.abs, f.mtime, size);
   try {
     if (!fs.existsSync(cache)) {
       // 동영상은 10% 지점 프레임을 썸네일로
       const src = f.kind === 'video' ? await frameAt(f.abs, ((f.duration || 0) * 0.1).toFixed(3), size) : f.abs;
+      if (f.kind === 'video' && (!src || !src.length)) return res.sendStatus(415);
       await sharp(src, { failOn: 'none' }).rotate().resize(size, size, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 80 }).toFile(cache);
     }
     res.set('Cache-Control', 'max-age=86400').sendFile(cache);

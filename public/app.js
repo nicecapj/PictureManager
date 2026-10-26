@@ -87,10 +87,32 @@ async function poll(onDone, title) {
       (s.stats.errors?.length ? `<span style="color:var(--danger)">오류 ${s.stats.errors.length}</span>` : '') : '';
     if (s.running) return setTimeout(tick, 300);
     setTimeout(() => { $('#progress').classList.add('hidden'); $('#jobOverlay').classList.add('hidden'); }, 900);
-    onDone(s);
+    onDone && onDone(s);
   };
   tick();
 }
+
+if ($('#btnCancelJob')) {
+  $('#btnCancelJob').onclick = async () => {
+    try { await api('/api/cancel', {}); toast('작업 중단을 요청했습니다…'); } catch (e) { toast('⚠ ' + e.message); }
+  };
+}
+
+// 페이지 로드 시 진행 중인 작업이나 이전 스캔 결과가 있으면 복원
+api('/api/status').then(async (s) => {
+  if (s.running) {
+    $('#btnScan').disabled = true;
+    poll(async (fin) => {
+      $('#btnScan').disabled = false;
+      if (fin.phase === 'error') return toast('⚠ ' + fin.message);
+      data = await api('/api/result');
+      render();
+    }, s.phase.includes('동기화') ? '🚀 동기화 진행 중…' : '🔍 사진·동영상 스캔 · 분석 중…');
+  } else if (s.phase === 'done' || s.phase === 'synced') {
+    const r = await api('/api/result');
+    if (r.files?.length) { data = r; render(); }
+  }
+}).catch(() => {});
 
 $('#btnScan').onclick = async () => {
   const a = $('#dirA').value.trim(), b = $('#dirB').value.trim();
